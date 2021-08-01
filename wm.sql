@@ -329,7 +329,7 @@ end $$ language plpgsql;
 drop function if exists wm_bend_attrs;
 drop function if exists wm_elimination;
 drop function if exists wm_exaggeration;
-drop type if exists wm_t_attrs;
+drop type if exists wm_t_attrs cascade;
 create type wm_t_attrs as (
   adjsize real,
   baselinelength real,
@@ -726,6 +726,176 @@ begin
   end if;
 end $$ language plpgsql;
 
+drop function if exists wm_combine_bend;
+create function wm_combine_bend(
+  INOUT bends geometry[],
+  n int
+) as $$
+declare
+  NEW_PEAK_MOVE_COEF constant float = 1.2;
+  VERTEX_MOVE_COEF constant float = 0.2;
+  combined geometry;
+  newbends geometry[];
+  points geometry[];
+  i int;
+  j int;
+  maxleft int;
+  maxright int;
+  maxcenter int;
+  maxsum float = 0;
+  currsum float;
+  l int = 0;
+  center geometry;
+  azimuth float;
+  distance float;
+  gendistance float;
+  newcenter geometry;
+begin
+  -- identify the peak of left bend
+  for i in 1..st_npoints(bends[n-1]) loop
+    currsum = st_distance(st_pointn(bends[n-1], i), st_startpoint(bends[n-1])) +
+              st_distance(st_pointn(bends[n-1], i), st_endpoint(bends[n-1]));
+    if maxsum = 0 or currsum > maxsum then
+      maxsum = currsum;
+      maxleft = i;
+    end if;
+  end loop;
+
+  -- identify the peak of right bend
+  maxsum = 0;
+  for i in 1..st_npoints(bends[n+1]) loop
+    currsum = st_distance(st_pointn(bends[n+1], i), st_startpoint(bends[n+1])) +
+              st_distance(st_pointn(bends[n+1], i), st_endpoint(bends[n+1]));
+    if maxsum = 0 or currsum > maxsum then
+      maxsum = currsum;
+      maxright = i;
+    end if;
+  end loop;
+
+  -- identify the peak of center bend
+  maxsum = 0;
+  for i in 1..st_npoints(bends[n]) loop
+    currsum = st_distance(st_pointn(bends[n], i), st_startpoint(bends[n])) +
+              st_distance(st_pointn(bends[n], i), st_endpoint(bends[n]));
+    if maxsum = 0 or currsum > maxsum then
+      maxsum = currsum;
+      maxcenter = i;
+    end if;
+  end loop;
+
+  -- calculate position of the peak of combined bend (D')
+  center = st_centroid(st_makeline(st_pointn(bends[n-1], maxleft),
+                                   st_pointn(bends[n+1], maxright)));
+  azimuth = st_azimuth(st_pointn(bends[n], maxcenter), center);
+  distance = st_distance(st_transform(st_pointn(bends[n], maxcenter), 3346), st_transform(center, 3346));
+  newcenter = st_transform(st_project(st_transform(st_pointn(bends[n], maxcenter), 4326), distance * NEW_PEAK_MOVE_COEF, azimuth)::geometry, 3857);
+
+  -- calculate azimuth of left bend point displacement
+  azimuth = st_azimuth(st_pointn(bends[n-1], maxleft), newcenter);
+  -- calculate distance between left bend peak and new bend peak
+  gendistance = st_distance(st_transform(st_pointn(bends[n-1], maxleft), 3346), st_transform(newcenter, 3346));
+
+  -- add all points from left bend up to and including the peak into combined geometry
+  for i in 1..maxleft loop
+    l = l + 1;
+    if i = 1 or i = 2 then
+      points[l] = st_pointn(bends[n-1], i);
+    else
+      -- all points except the first one are moved towards the peak of combined bend
+      if i = maxleft then
+        distance = gendistance * VERTEX_MOVE_COEF;
+      else
+        distance = gendistance * VERTEX_MOVE_COEF *
+                   st_distance(st_transform(st_pointn(bends[n-1], 1), 3346), st_transform(st_pointn(bends[n-1], i), 3346)) /
+                   (
+                     st_distance(st_transform(st_pointn(bends[n-1], 1), 3346), st_transform(st_pointn(bends[n-1], i), 3346)) +
+                     st_distance(st_transform(st_pointn(bends[n-1], maxleft), 3346), st_transform(st_pointn(bends[n-1], i), 3346))
+                   );
+      end if;
+      points[l] = st_transform(st_project(st_transform(st_pointn(bends[n-1], i), 4326), distance, azimuth)::geometry, 3857);
+    end if;
+  end loop;
+
+  l = l + 1;
+  points[l] = newcenter;
+
+  -- calculate azimuth of right bend point displacement
+  azimuth = st_azimuth(st_pointn(bends[n+1], maxright), newcenter);
+  -- calculate distance between right bend peak and new bend peak
+  gendistance = st_distance(st_transform(st_pointn(bends[n+1], maxright), 3346), st_transform(newcenter, 3346));
+
+  -- add all points from right bend from peak point to the end into combined geometry
+  j = st_npoints(bends[n+1]);
+  for i in maxright..j loop
+    l = l + 1;
+    if i = j or i = j - 1 then
+      points[l] = st_pointn(bends[n+1], i);
+    else
+      -- all points except the first one are moved towards the peak of combined bend
+      if i = maxright then
+        distance = gendistance * VERTEX_MOVE_COEF;
+      else
+        distance = gendistance * VERTEX_MOVE_COEF *
+                   st_distance(st_transform(st_pointn(bends[n+1], 1), 3346), st_transform(st_pointn(bends[n+1], i), 3346)) /
+                   (
+                     st_distance(st_transform(st_pointn(bends[n+1], 1), 3346), st_transform(st_pointn(bends[n+1], i), 3346)) +
+                     st_distance(st_transform(st_pointn(bends[n+1], maxright), 3346), st_transform(st_pointn(bends[n+1], i), 3346))
+                   );
+      end if;
+      points[l] = st_transform(st_project(st_transform(st_pointn(bends[n+1], i), 4326), distance, azimuth)::geometry, 3857);
+    end if;
+  end loop;
+
+  bends[n-1] = st_makeline(points);
+  for i in 1..n-1 loop
+    newbends[i] = bends[i];
+  end loop;
+  for i in n+2..array_length(bends, 1) loop
+    newbends[i-2] = bends[i];
+  end loop;
+  bends = newbends;
+end $$ language plpgsql;
+
+drop function if exists wm_combination;
+create function wm_combination(
+  INOUT bends geometry[],
+  INOUT attrs wm_t_attrs[],
+  dhalfcircle float,
+  dbgname text default null,
+  dbggen integer default null,
+  OUT mutated boolean
+) as $$
+declare
+  MIN_CURVATURE constant float = 0.02;
+  MIN_BASELENGTH_RATIO constant float = 0.8;
+  MAX_BASELENGTH_RATIO constant float = 1.2;
+  i int = 2; /* TODO: process first and last bend as well */
+  desired_size constant float default pi()*(dhalfcircle^2)/8;
+begin
+  mutated = false;
+  raise notice 'COMB =================';
+  raise notice 'COMB START gen=%, bends=%, desired_size=%', dbggen, array_length(attrs, 1), desired_size;
+  while i <= array_length(attrs, 1) - 1 loop
+    raise notice 'COMB % as=% bl=% (%/%) cu=%', i, attrs[i].adjsize, attrs[i].baselinelength, attrs[i].baselinelength / attrs[i-1].baselinelength, attrs[i].baselinelength / attrs[i+1].baselinelength, attrs[i].curvature;
+    if attrs[i].adjsize < desired_size and
+       attrs[i].curvature   > MIN_CURVATURE and
+       attrs[i-1].curvature > MIN_CURVATURE and
+       attrs[i+1].curvature > MIN_CURVATURE and
+       attrs[i].baselinelength / attrs[i-1].baselinelength > MIN_BASELENGTH_RATIO and
+       attrs[i].baselinelength / attrs[i-1].baselinelength < MAX_BASELENGTH_RATIO and
+       attrs[i].baselinelength / attrs[i+1].baselinelength > MIN_BASELENGTH_RATIO and
+       attrs[i].baselinelength / attrs[i+1].baselinelength < MAX_BASELENGTH_RATIO
+    then
+      raise notice 'COMBINING BEND %', i;
+      select * from wm_combine_bend(bends, i) into bends;
+      mutated = true;
+      -- Return straight away, do not try to combine anything else
+      return;
+    end if;
+    i = i + 1;
+  end loop;
+  raise notice 'COMB nothing to combine';
+end $$ language plpgsql;
 
 drop function if exists ST_SimplifyWM_Estimate;
 create function ST_SimplifyWM_Estimate(
@@ -814,7 +984,10 @@ begin
           dhalfcircle, intersect_patience, dbgname, gen) into bends, mutated;
       end if;
 
-      -- TODO: wm_combination
+      if not mutated then
+        select * from wm_combination(bends, attrs,
+          dhalfcircle, dbgname, gen) into bends, attrs, mutated;
+      end if;
 
       if not mutated then
         select * from wm_elimination(bends, attrs,

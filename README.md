@@ -10,9 +10,7 @@ the same authors, 1998.
 Status
 ------
 
-The repository is archived and no longer developed. If you have used this code
-as a basis and created an improved version, ping me, I will link it from this
-README.
+This repository is forked from Motiejus archived one continuing it's development.
 
 Structure
 ---------
