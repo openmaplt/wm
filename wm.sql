@@ -343,6 +343,11 @@ create function wm_bend_attrs(
 ) returns wm_t_attrs[] as $$
 declare
   isolation_threshold constant real default 0.5;
+  -- Bent can only be isolated, when it is curvy enough
+  minimum_isolated_curvature constant real = pi() / 2;
+  -- Neighbouring bends should not be very straight, because in that case
+  -- isolated bend together with neighbouring ones visually form one bend
+  minimum_neighbouring_curvature constant real = 0.1;
   attrs wm_t_attrs[];
   attr wm_t_attrs;
   bend geometry;
@@ -355,7 +360,7 @@ begin
     bend = bends[i];
     attr.adjsize = 0;
     attr.baselinelength = st_distance(st_startpoint(bend), st_endpoint(bend));
-    attr.curvature = wm_inflection_angle(bend) / st_length(bend);
+    attr.curvature = wm_inflection_angle(bend) /*/ st_length(bend)*/; -- TS curvature does not depend on the length of the line
     attr.isolated = false;
     if st_numpoints(bend) >= 3 then
       attr.adjsize = wm_adjsize(bend);
@@ -386,8 +391,14 @@ begin
     end if;
 
     needs_curvature = attrs[i].curvature * isolation_threshold;
-    if attrs[i-1].curvature < needs_curvature and
-       attrs[i+1].curvature < needs_curvature then
+    if attrs[i].curvature > minimum_isolated_curvature and
+       attrs[i-1].curvature < needs_curvature and
+       attrs[i+1].curvature < needs_curvature and
+       /* TODO: neighbouring curvature should probably be calculated for some
+                distance (which would be dependant on provided halfcircle size) */
+       attrs[i-1].curvature > minimum_neighbouring_curvature and
+       attrs[i+1].curvature > minimum_neighbouring_curvature
+    then
       attr = attrs[i];
       attr.isolated = true;
       attrs[i] = attr;
@@ -873,10 +884,7 @@ declare
   desired_size constant float default pi()*(dhalfcircle^2)/8;
 begin
   mutated = false;
-  raise notice 'COMB =================';
-  raise notice 'COMB START gen=%, bends=%, desired_size=%', dbggen, array_length(attrs, 1), desired_size;
   while i <= array_length(attrs, 1) - 1 loop
-    raise notice 'COMB % as=% bl=% (%/%) cu=%', i, attrs[i].adjsize, attrs[i].baselinelength, attrs[i].baselinelength / attrs[i-1].baselinelength, attrs[i].baselinelength / attrs[i+1].baselinelength, attrs[i].curvature;
     if attrs[i].adjsize < desired_size and
        attrs[i].curvature   > MIN_CURVATURE and
        attrs[i-1].curvature > MIN_CURVATURE and
@@ -886,7 +894,6 @@ begin
        attrs[i].baselinelength / attrs[i+1].baselinelength > MIN_BASELENGTH_RATIO and
        attrs[i].baselinelength / attrs[i+1].baselinelength < MAX_BASELENGTH_RATIO
     then
-      raise notice 'COMBINING BEND %', i;
       select * from wm_combine_bend(bends, i) into bends;
       mutated = true;
       -- Return straight away, do not try to combine anything else
@@ -894,7 +901,6 @@ begin
     end if;
     i = i + 1;
   end loop;
-  raise notice 'COMB nothing to combine';
 end $$ language plpgsql;
 
 drop function if exists ST_SimplifyWM_Estimate;
