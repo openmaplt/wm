@@ -186,7 +186,8 @@ begin
       ) into phead;
 
       -- if the bend got too short, stop processing it
-      exit when array_length(phead, 1) < 3;
+      -- bend should have at least 3 vertexes
+      exit when array_length(phead, 1) < 4;
 
       -- inflection angle between ptail[1:3] is "large", stop processing
       exit when abs(st_angle(phead[1], phead[2], phead[3]) - pi()) > small_angle;
@@ -326,10 +327,10 @@ begin
   end loop;
 end $$ language plpgsql;
 
-drop function if exists wm_bend_attrs;
+--drop function if exists wm_bend_attrs;
 drop function if exists wm_elimination;
 drop function if exists wm_exaggeration;
-drop type if exists wm_t_attrs cascade;
+/*drop type if exists wm_t_attrs cascade;
 create type wm_t_attrs as (
   adjsize real,
   baselinelength real,
@@ -360,7 +361,7 @@ begin
     bend = bends[i];
     attr.adjsize = 0;
     attr.baselinelength = st_distance(st_startpoint(bend), st_endpoint(bend));
-    attr.curvature = wm_inflection_angle(bend) /*/ st_length(bend)*/; -- TS curvature does not depend on the length of the line
+    attr.curvature = wm_inflection_angle(bend); -- removed / st_length(bend) TS curvature does not depend on the length of the line
     attr.isolated = false;
     if st_numpoints(bend) >= 3 then
       attr.adjsize = wm_adjsize(bend);
@@ -394,8 +395,8 @@ begin
     if attrs[i].curvature > minimum_isolated_curvature and
        attrs[i-1].curvature < needs_curvature and
        attrs[i+1].curvature < needs_curvature and
-       /* TODO: neighbouring curvature should probably be calculated for some
-                distance (which would be dependant on provided halfcircle size) */
+       -- TODO: neighbouring curvature should probably be calculated for some
+       --       distance (which would be dependant on provided halfcircle size)
        attrs[i-1].curvature > minimum_neighbouring_curvature and
        attrs[i+1].curvature > minimum_neighbouring_curvature
     then
@@ -413,7 +414,7 @@ begin
   end loop;
 
   return attrs;
-end $$ language plpgsql;
+end $$ language plpgsql;*/
 
 -- sm_st_split a line by a point in a more robust way than st_split.
 -- See https://trac.osgeo.org/postgis/ticket/2192
@@ -441,7 +442,6 @@ end $$ language plpgsql;
 drop function if exists wm_exaggerate_bend2;
 create function wm_exaggerate_bend2(
   INOUT bend geometry,
-  size float,
   desired_size float
 ) as $$
 declare
@@ -454,6 +454,7 @@ declare
   point geometry;
   sss float;
   protect int = 10;
+  size float = wm_adjsize(bend);
 begin
   if size = 0 then
     raise 'invalid input: zero-area bend';
@@ -574,7 +575,7 @@ end $$ language plpgsql;
 -- wm_exaggeration is the Exaggeration Operator described in the WM paper.
 create function wm_exaggeration(
   INOUT bends geometry[],
-  attrs wm_t_attrs[],
+  sbend int,
   dhalfcircle float,
   intersect_patience integer,
   dbgname text default null,
@@ -582,134 +583,104 @@ create function wm_exaggeration(
   OUT mutated boolean
 ) as $$
 declare
+  isolation_threshold constant real default 0.9;
+  -- Bent can only be isolated, when it is curvy enough
+  minimum_isolated_curvature constant real = pi() / 2.1;
+  -- Neighbouring bends should not be very straight, because in that case
+  -- isolated bend together with neighbouring ones visually form one bend
+  minimum_neighbouring_curvature constant real = 0.1;
+  needs_curvature float;
   desired_size constant float default pi()*(dhalfcircle^2)/8;
   bend geometry;
   tmpint geometry;
-  i integer;
+  i integer = sbend; /* TODO: remove variable i altogether */
   n integer;
   last_id integer;
+  curvature real;
+  curvature_prev real;
+  curvature_next real;
 begin
   mutated = false;
-  <<bendloop>>
-  for i in 1..array_length(attrs, 1) loop
-    if attrs[i].isolated and attrs[i].adjsize < desired_size then
-      bend = wm_exaggerate_bend2(bends[i], attrs[i].adjsize, desired_size);
-      -- Does bend intersect with the previous or next
-      -- intersect_patience bends? If they do, abort exaggeration for this one.
+  curvature = wm_inflection_angle(bends[sbend]);
+  curvature_prev = wm_inflection_angle(bends[sbend-1]);
+  curvature_next = wm_inflection_angle(bends[sbend+1]);
+  needs_curvature = curvature * isolation_threshold;
+  if curvature > minimum_isolated_curvature and
+     curvature_prev < needs_curvature and
+     curvature_next < needs_curvature and
+     /* TODO: neighbouring curvature should probably be calculated for some
+              distance (which would be dependant on provided halfcircle size) */
+     curvature_prev > minimum_neighbouring_curvature and
+     curvature_next > minimum_neighbouring_curvature
+  then
+    if dbgname is not null then
+      insert into wm_debug (stage, name, gen, nbend, way) values(
+        'before_exaggeration', dbgname, dbggen, curvature_prev * 1000, bends[i-1]);
+      insert into wm_debug (stage, name, gen, nbend, way) values(
+        'before_exaggeration', dbgname, dbggen, curvature      * 1000, bends[i]);
+      insert into wm_debug (stage, name, gen, nbend, way) values(
+        'before_exaggeration', dbgname, dbggen, curvature_next * 1000, bends[i+1]);
+    end if;
+    bend = wm_exaggerate_bend2(bends[i], desired_size);
+    -- Does bend intersect with the previous or next
+    -- intersect_patience bends? If they do, abort exaggeration for this one.
 
-      -- Do close-by bends intersect with this one? Special
-      -- handling first, because 2 vertices need to be removed before checking.
-      n = st_npoints(bends[i-1]);
-      if n > 3 then
-        continue when st_intersects(bend,
-          st_removepoint(st_removepoint(bends[i-1], n-1), n-2));
+    -- Do close-by bends intersect with this one? Special
+    -- handling first, because 2 vertices need to be removed before checking.
+    n = st_npoints(bends[i-1]);
+    if n > 3 then
+      if st_intersects(bend, st_removepoint(st_removepoint(bends[i-1], n-1), n-2)) then
+        return;
       end if;
-      if n > 2 then
-        tmpint = st_intersection(bend, st_removepoint(bends[i-1], n-1));
-        continue when st_npoints(tmpint) > 1;
+    elseif n > 2 then
+      tmpint = st_intersection(bend, st_removepoint(bends[i-1], n-1));
+      if st_npoints(tmpint) > 1 then
+        return;
       end if;
+    end if;
 
-      n = st_npoints(bends[i+1]);
-      if n > 3 then
-        continue when st_intersects(bend,
-          st_removepoint(st_removepoint(bends[i+1], 0), 0));
+    n = st_npoints(bends[i+1]);
+    if n > 3 then
+      if st_intersects(bend, st_removepoint(st_removepoint(bends[i+1], 0), 0)) then
+        return;
       end if;
-      if n > 2 then
-        tmpint = st_intersection(bend, st_removepoint(bends[i+1], 0));
-        continue when st_npoints(tmpint) > 1;
+    elseif n > 2 then
+      tmpint = st_intersection(bend, st_removepoint(bends[i+1], 0));
+      if st_npoints(tmpint) > 1 then
+        return;
       end if;
+    end if;
 
-      for n in -intersect_patience+1..intersect_patience-1 loop
-        continue when n in (-1, 0, 1);
-        continue when i+n < 1;
-        continue when i+n > array_length(attrs, 1);
+    for n in -intersect_patience+1..intersect_patience-1 loop
+      continue when n in (-1, 0, 1);
+      continue when i+n < 1;
+      continue when i+n > array_length(bends, 1);
 
-        -- More special handling: if the neigbhoring bend has 3 vertices, the
-        -- neighbor's neighbor may just touch the tmpbendattr.bend; in this
-        -- case, the nearest vertex should be removed before comparing.
-        tmpint = bends[i+n];
-        if st_npoints(tmpint) > 2 then
-          if n = -2 and st_npoints(bends[i+n+1]) = 3 then
-            tmpint = st_removepoint(tmpint, st_npoints(tmpint)-1);
-          elsif n = 2 and st_npoints(bends[i+n-1]) = 3 then
-            tmpint = st_removepoint(tmpint, 0);
-          end if;
+      -- More special handling: if the neigbhoring bend has 3 vertices, the
+      -- neighbor's neighbor may just touch the tmpbendattr.bend; in this
+      -- case, the nearest vertex should be removed before comparing.
+      tmpint = bends[i+n];
+      if st_npoints(tmpint) > 2 then
+        if n = -2 and st_npoints(bends[i+n+1]) = 3 then
+          tmpint = st_removepoint(tmpint, st_npoints(tmpint)-1);
+        elsif n = 2 and st_npoints(bends[i+n-1]) = 3 then
+          tmpint = st_removepoint(tmpint, 0);
         end if;
-
-        continue bendloop when st_intersects(bend, tmpint);
-      end loop;
-
-      -- No intersections within intersect_patience, mutate bend!
-      mutated = true;
-      bends[i] = bend;
-
-      -- remove last vertex of the previous bend and first vertex of the next
-      -- bend, because bends always share a line segment together this is
-      -- duplicated in a few places, because PostGIS does not allow (?)
-      -- mutating an array when passed to a function.
-      bends[i-1] = st_addpoint(
-        st_removepoint(bends[i-1], st_npoints(bends[i-1])-1),
-        st_pointn(bends[i], 1),
-        -1
-      );
-
-      bends[i+1] = st_addpoint(
-        st_removepoint(bends[i+1], 0),
-        st_pointn(bends[i], st_npoints(bends[i])-1),
-        0
-      );
-      if dbgname is not null then
-        insert into wm_debug (stage, name, gen, nbend, way) values(
-          'gexaggeration', dbgname, dbggen, i, bends[i]);
       end if;
-    end if;
-  end loop;
-end $$ language plpgsql;
 
-create function wm_elimination(
-  INOUT bends geometry[],
-  attrs wm_t_attrs[],
-  dhalfcircle float,
-  dbgname text default null,
-  dbggen integer default null,
-  OUT mutated boolean
-) as $$
-declare
-  desired_size constant float default pi()*(dhalfcircle^2)/8;
-  leftsize float;
-  rightsize float;
-  i int4;
-begin
-  mutated = false;
+      if st_intersects(bend, tmpint) then
+        return;
+      end if;
+    end loop;
 
-  i = 1;
-  while i < array_length(attrs, 1)-1 loop
-    i = i + 1;
-    continue when attrs[i].adjsize = 0;
-    continue when attrs[i].adjsize > desired_size;
-
-    if i = 2 then
-      leftsize = attrs[i].adjsize + 1;
-    else
-      leftsize = attrs[i-1].adjsize;
-    end if;
-
-    if i = array_length(attrs, 1)-1 then
-      rightsize = attrs[i].adjsize + 1;
-    else
-      rightsize = attrs[i+1].adjsize;
-    end if;
-
-    continue when attrs[i].adjsize >= leftsize;
-    continue when attrs[i].adjsize >= rightsize;
-
-    -- Local minimum. Elminate bend!
+    -- No intersections within intersect_patience, mutate bend!
     mutated = true;
-    bends[i] = st_makeline(st_pointn(bends[i], 1), st_pointn(bends[i], -1));
+    bends[i] = bend;
 
-    -- remove last vertex of the previous bend and
-    -- first vertex of the next bend, because bends always
-    -- share a line segment together
+    -- remove last vertex of the previous bend and first vertex of the next
+    -- bend, because bends always share a line segment together this is
+    -- duplicated in a few places, because PostGIS does not allow (?)
+    -- mutating an array when passed to a function.
     bends[i-1] = st_addpoint(
       st_removepoint(bends[i-1], st_npoints(bends[i-1])-1),
       st_pointn(bends[i], 1),
@@ -721,10 +692,68 @@ begin
       st_pointn(bends[i], st_npoints(bends[i])-1),
       0
     );
-    -- the next bend's adjsize is now messed up; it should not be taken
-    -- into consideration for other local minimas. Skip over 2.
-    i = i + 2;
-  end loop;
+    if dbgname is not null then
+      insert into wm_debug (stage, name, gen, nbend, way) values(
+        'after_exaggeration', dbgname, dbggen, i, bends[i]);
+    end if;
+  end if;
+end $$ language plpgsql;
+
+create function wm_elimination(
+  INOUT bends geometry[],
+  bend int,
+  dhalfcircle float,
+  dbgname text default null,
+  dbggen integer default null,
+  OUT mutated boolean
+) as $$
+declare
+  desired_size constant float default pi()*(dhalfcircle^2)/8;
+  leftsize float;
+  rightsize float;
+  i int4;
+  l_size float = wm_adjsize(bends[i]);
+begin
+  mutated = false;
+
+  i = bend;
+  if bend = 2 then
+    -- for the leftmost bend we assume it is smaller than non existant "leftsize"
+    leftsize = l_size + 1;
+  else
+    leftsize = wm_adjsize(bends[bend - 1]);
+  end if;
+
+  if bend = array_length(bends, 1) - 1 then
+    -- for the rightmost bend we assume it is smaller than non existant "rightsize"
+    rightsize = l_size + 1;
+  else
+    rightsize = wm_adjsize(bends[bend + 1]);
+  end if;
+
+  if l_size >= leftsize or
+     l_size >= rightsize then
+    return;
+  end if;
+
+  -- Local minimum. Elminate bend!
+  mutated = true;
+  bends[i] = st_makeline(st_pointn(bends[i], 1), st_pointn(bends[i], -1));
+
+  -- remove last vertex of the previous bend and
+  -- first vertex of the next bend, because bends always
+  -- share a line segment together
+  bends[i-1] = st_addpoint(
+    st_removepoint(bends[i-1], st_npoints(bends[i-1])-1),
+    st_pointn(bends[i], 1),
+    -1
+  );
+
+  bends[i+1] = st_addpoint(
+    st_removepoint(bends[i+1], 0),
+    st_pointn(bends[i], st_npoints(bends[i])-1),
+    0
+  );
 
   if dbgname is not null then
     insert into wm_debug(stage, name, gen, nbend, way) values(
@@ -762,6 +791,15 @@ declare
   gendistance float;
   newcenter geometry;
 begin
+  if dbgname is not null then
+    insert into wm_debug (stage, name, gen, nbend, way) values(
+      'before_combination', dbgname, dbggen, curvature_prev * 1000, bends[n-1]);
+    insert into wm_debug (stage, name, gen, nbend, way) values(
+      'before_combination', dbgname, dbggen, curvature      * 1000, bends[n]);
+    insert into wm_debug (stage, name, gen, nbend, way) values(
+      'before_combination', dbgname, dbggen, curvature_next * 1000, bends[n+1]);
+  end if;
+
   -- identify the peak of left bend
   for i in 1..st_npoints(bends[n-1]) loop
     currsum = st_distance(st_pointn(bends[n-1], i), st_startpoint(bends[n-1])) +
@@ -865,42 +903,55 @@ begin
     newbends[i-2] = bends[i];
   end loop;
   bends = newbends;
+
+  if dbgname is not null then
+    insert into wm_debug (stage, name, gen, nbend, way) values(
+      'after_combination', dbgname, dbggen, n, bends[n-1]);
+  end if;
 end $$ language plpgsql;
 
 drop function if exists wm_combination;
 create function wm_combination(
   INOUT bends geometry[],
-  INOUT attrs wm_t_attrs[],
+  bend int,
   dhalfcircle float,
   dbgname text default null,
   dbggen integer default null,
   OUT mutated boolean
 ) as $$
 declare
-  MIN_CURVATURE constant float = 0.02;
+  MIN_CURVATURE constant float = pi() / 2;
   MIN_BASELENGTH_RATIO constant float = 0.8;
   MAX_BASELENGTH_RATIO constant float = 1.2;
   i int = 2; /* TODO: process first and last bend as well */
   desired_size constant float default pi()*(dhalfcircle^2)/8;
+  l_size float = wm_adjsize(bends[i]);
+  l_curvature float = wm_inflection_angle(bends[i]);
+  l_curvature_prev float = wm_inflection_angle(bends[i-1]);
+  l_curvature_next float = wm_inflection_angle(bends[i+1]);
+  l_baseline float = st_distance(st_startpoint(bends[i]), st_endpoint(bends[i]));
+  l_baseline_prev float = st_distance(st_startpoint(bends[i-1]), st_endpoint(bends[i-1]));
+  l_baseline_next float = st_distance(st_startpoint(bends[i+1]), st_endpoint(bends[i+1]));
 begin
   mutated = false;
-  while i <= array_length(attrs, 1) - 1 loop
-    if attrs[i].adjsize < desired_size and
-       attrs[i].curvature   > MIN_CURVATURE and
-       attrs[i-1].curvature > MIN_CURVATURE and
-       attrs[i+1].curvature > MIN_CURVATURE and
-       attrs[i].baselinelength / attrs[i-1].baselinelength > MIN_BASELENGTH_RATIO and
-       attrs[i].baselinelength / attrs[i-1].baselinelength < MAX_BASELENGTH_RATIO and
-       attrs[i].baselinelength / attrs[i+1].baselinelength > MIN_BASELENGTH_RATIO and
-       attrs[i].baselinelength / attrs[i+1].baselinelength < MAX_BASELENGTH_RATIO
+  if bend > 1 and bend < array_length(bends, 1) - 1 then
+    i = bend;
+    if l_size < desired_size and
+       l_curvature   > MIN_CURVATURE and
+       l_curvature_prev > MIN_CURVATURE and
+       l_curvature_next > MIN_CURVATURE and
+       l_baseline / l_baseline_prev > MIN_BASELENGTH_RATIO and
+       l_baseline / l_baseline_prev < MAX_BASELENGTH_RATIO and
+       l_baseline / l_baseline_next > MIN_BASELENGTH_RATIO and
+       l_baseline / l_baseline_next < MAX_BASELENGTH_RATIO
     then
       select * from wm_combine_bend(bends, i) into bends;
       mutated = true;
-      -- Return straight away, do not try to combine anything else
+      -- Return straight away, do not try to combine anything
       return;
     end if;
     i = i + 1;
-  end loop;
+  end if;
 end $$ language plpgsql;
 
 drop function if exists ST_SimplifyWM_Estimate;
@@ -954,6 +1005,10 @@ declare
   attrs wm_t_attrs[];
   mutated boolean;
   l_type text;
+  l_size float;
+  l_minsize float;
+  l_minbend int;
+  skipped_bends integer[] = array[0];
 begin
   if intersect_patience is null then
     intersect_patience = 50;
@@ -967,16 +1022,24 @@ begin
     raise 'Unknown geometry type %', l_type;
   end if;
 
+  raise notice 'minimum halfcircle=%', pi()*(dhalfcircle^2)/8;
+
   <<lineloop>>
   for i in 1..array_length(lines, 1) loop
     mutated = true;
     gen = 1;
 
-    while mutated loop
+    while mutated or array_length(skipped_bends, 1) > 1 loop
 
-      if dbgname is not null then
+      --raise notice 'gen=%', gen;
+      /*if dbgname is not null then
         insert into wm_debug (stage, name, gen, nbend, way) values(
           'afigures', dbgname, gen, i, lines[i]);
+      end if;*/
+
+      if st_npoints(lines[i]) < 3 then
+        mutated = false;
+        continue;
       end if;
 
       bends = wm_detect_bends(lines[i], dbgname, gen);
@@ -984,23 +1047,47 @@ begin
 
       select * from wm_self_crossing(bends, dbgname, gen) into bends, mutated;
       if not mutated then
-        attrs = wm_bend_attrs(bends, dbgname, gen);
+        l_minsize = 0;
+        for j in 1..array_length(bends, 1) loop
+          if j != ALL(skipped_bends) then
+            if st_npoints(bends[j]) > 2 then
+              l_size = wm_adjsize(bends[j]);
+              if l_size < l_minsize or l_minsize = 0 then
+                l_minbend = j;
+                l_minsize = l_size;
+              end if;
+            end if;
+          end if;
+        end loop;
+        /*raise notice 'min bend=% (%), total bends=%', l_minbend, l_minsize, array_length(bends, 1);*/
+        -- Number of iterations is limited at 150 as a security measure.
+        -- This number can be safely increased.
+        if (l_minsize > pi()*(dhalfcircle^2)/8) or (gen > 150) then
+          skipped_bends = array[0];
+          continue;
+        end if;
+      end if;
 
-        select * from wm_exaggeration(bends, attrs,
+      if not mutated then
+        select * from wm_exaggeration(bends, l_minbend,
           dhalfcircle, intersect_patience, dbgname, gen) into bends, mutated;
       end if;
 
       if not mutated then
-        select * from wm_combination(bends, attrs,
-          dhalfcircle, dbgname, gen) into bends, attrs, mutated;
-      end if;
-
-      if not mutated then
-        select * from wm_elimination(bends, attrs,
+        select * from wm_combination(bends, l_minbend,
           dhalfcircle, dbgname, gen) into bends, mutated;
       end if;
 
+      if not mutated then
+        select * from wm_elimination(bends, l_minbend,
+          dhalfcircle, dbgname, gen) into bends, mutated;
+        if not mutated then
+          skipped_bends = array_append(skipped_bends, l_minbend);
+        end if;
+      end if;
+
       if mutated then
+        skipped_bends = array[0];
         lines[i] = st_linemerge(st_union(bends));
 
         if st_geometrytype(lines[i]) != 'ST_LineString' then
